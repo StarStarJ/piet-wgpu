@@ -7,10 +7,10 @@ use crate::{
     WgpuRenderer,
 };
 use futures::task::SpawnExt;
-use lyon::lyon_tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
-    StrokeVertex, VertexBuffers,
-};
+use lyon::{lyon_tessellation::{
+    BuffersBuilder, FillGeometryBuilder, FillOptions, FillTessellator, FillVertex,
+    StrokeGeometryBuilder, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers,
+}, path::traits::PathBuilder};
 use lyon::tessellation;
 use piet::{
     kurbo::{Affine, Point, Rect, Shape, Size, Vec2},
@@ -137,6 +137,7 @@ pub enum Brush {
     Solid(Color),
 }
 
+#[derive(Clone)]
 pub struct WgpuImage {}
 
 impl<'a> RenderContext for WgpuRenderContext<'a> {
@@ -191,10 +192,12 @@ impl<'a> RenderContext for WgpuRenderContext<'a> {
                         primitive_id,
                         ..Default::default()
                     }
-                }),
+                }) as &mut dyn StrokeGeometryBuilder,
             );
         } else if let Some(line) = shape.as_line() {
             let mut builder = lyon::path::Path::builder();
+            builder.begin(translate_point(line.p0));
+            builder.line_to(translate_point(line.p1));
             builder.begin(lyon::geom::point(line.p0.x as f32, line.p0.y as f32));
             builder.line_to(lyon::geom::point(line.p1.x as f32, line.p1.y as f32));
             builder.close();
@@ -216,7 +219,7 @@ impl<'a> RenderContext for WgpuRenderContext<'a> {
                         primitive_id,
                         ..Default::default()
                     }
-                }),
+                }) as &mut dyn StrokeGeometryBuilder,
             );
         } else {
             let mut builder = lyon::path::Path::builder();
@@ -270,7 +273,7 @@ impl<'a> RenderContext for WgpuRenderContext<'a> {
                         primitive_id,
                         ..Default::default()
                     }
-                }),
+                }) as &mut dyn StrokeGeometryBuilder,
             );
         }
     }
@@ -285,24 +288,73 @@ impl<'a> RenderContext for WgpuRenderContext<'a> {
     }
 
     fn fill(&mut self, shape: impl piet::kurbo::Shape, brush: &impl piet::IntoBrush<Self>) {
+        let brush = brush.make_brush(self, || shape.bounding_box()).into_owned();
+        let Brush::Solid(color) = brush;
+        let color = format_color(&color);
+        let primitive_id = self.primitives.len() as u32 - 1;
+        let options = FillOptions::tolerance(0.02).with_fill_rule(tessellation::FillRule::NonZero);
+        let mut buf = BuffersBuilder::new(&mut self.geometry, |vertex: FillVertex| GpuVertex {
+            pos: vertex.position().to_array(),
+            color,
+            primitive_id,
+            ..Default::default()
+        });
+
         if let Some(rect) = shape.as_rect() {
-            let brush = brush.make_brush(self, || shape.bounding_box()).into_owned();
-            let Brush::Solid(color) = brush;
-            let color = format_color(&color);
-            let primitive_id = self.primitives.len() as u32 - 1;
-            self.fill_tess.tessellate_rectangle(
-                &lyon::geom::Rect::new(
-                    lyon::geom::Point::new(rect.x0 as f32, rect.y0 as f32),
-                    lyon::geom::Size::new(rect.width() as f32, rect.height() as f32),
-                ),
-                &FillOptions::tolerance(0.02).with_fill_rule(tessellation::FillRule::NonZero),
-                &mut BuffersBuilder::new(&mut self.geometry, |vertex: FillVertex| GpuVertex {
-                    pos: vertex.position().to_array(),
-                    color,
-                    primitive_id,
-                    ..Default::default()
-                }),
-            );
+            self.fill_tess
+                .tessellate_rectangle(
+                    &lyon::geom::Rect::new(
+                        lyon::geom::Point::new(rect.x0 as f32, rect.y0 as f32),
+                        lyon::geom::Size::new(rect.width() as f32, rect.height() as f32),
+                    ),
+                    &options,
+                    &mut buf as &mut dyn FillGeometryBuilder,
+                )
+                .unwrap();
+        }
+        if let Some(circle) = shape.as_circle() {
+            self.fill_tess
+                .tessellate_circle(
+                    translate_point(circle.center),
+                    circle.radius as f32,
+                    &options,
+                    &mut buf as &mut dyn FillGeometryBuilder,
+                )
+                .unwrap();
+        } else {
+            let mut builder = self
+                .fill_tess
+                .builder(&options, &mut buf as &mut dyn FillGeometryBuilder);
+            let mut in_subpath = false;
+            for el in shape.path_elements(0.01) {
+                match el {
+                    piet::kurbo::PathEl::MoveTo(p) => {
+                        builder.begin(translate_point(p));
+                        in_subpath = true;
+                    }
+                    piet::kurbo::PathEl::LineTo(p) => {
+                        builder.line_to(translate_point(p));
+                    }
+                    piet::kurbo::PathEl::QuadTo(ctrl, to) => {
+                        builder.quadratic_bezier_to(translate_point(ctrl), translate_point(to));
+                    }
+                    piet::kurbo::PathEl::CurveTo(c1, c2, p) => {
+                        builder.cubic_bezier_to(
+                            translate_point(c1),
+                            translate_point(c2),
+                            translate_point(p),
+                        );
+                    }
+                    piet::kurbo::PathEl::ClosePath => {
+                        in_subpath = false;
+                        builder.close();
+                    }
+                }
+            }
+            if in_subpath {
+                builder.end(false);
+            }
+            builder.build().unwrap();
         }
     }
 
@@ -478,7 +530,7 @@ impl<'a> RenderContext for WgpuRenderContext<'a> {
                 color,
                 primitive_id,
                 ..Default::default()
-            }),
+            }) as &mut dyn FillGeometryBuilder,
         );
         self.add_primitive();
     }
@@ -529,4 +581,9 @@ pub fn format_color(color: &Color) -> [f32; 4] {
         from_linear(color.2 as f32),
         color.3 as f32,
     ]
+}
+
+#[inline(always)]
+pub fn translate_point(point: Point) -> lyon::geom::Point<f32> {
+    lyon::geom::point(point.x as f32, point.y as f32)
 }
